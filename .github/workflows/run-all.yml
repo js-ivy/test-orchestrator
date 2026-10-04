@@ -1,0 +1,1130 @@
+name: Run tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      implementation:
+        description: "Implementation folder to test"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: run-all-tests
+  cancel-in-progress: false
+
+
+jobs:
+
+  # ================================================================
+  # PREPARE
+  # ================================================================
+
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      test: ${{ steps.resolve.outputs.test }}
+      test_exists: ${{ steps.resolve.outputs.test_exists }}
+      implementation: ${{ steps.resolve.outputs.implementation }}
+      repositories: ${{ steps.matrix.outputs.repositories }}
+    steps:
+
+      # --------------------------------------------------------------
+      # GitHub App token
+      # --------------------------------------------------------------
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ vars.OWNER }}
+          permission-contents: read
+
+      # --------------------------------------------------------------
+      # Checkout test-repo
+      # --------------------------------------------------------------
+
+      - name: Checkout test-repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REPOSITORY }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: test-repo
+          persist-credentials: false
+
+      # --------------------------------------------------------------
+      # Resolve test
+      # --------------------------------------------------------------
+
+      - name: Resolve test
+        id: resolve
+        working-directory: test-repo
+        shell: bash
+        env:
+          IMPLEMENTATION: ${{ inputs.implementation }}
+        run: |
+          set -euo pipefail
+
+          TEST=$(yq -r \
+            '.[strenv(IMPLEMENTATION)] // ""' \
+            config/test-map.yml)
+
+          echo "implementation=$IMPLEMENTATION" >> "$GITHUB_OUTPUT"
+
+          if [[ -z "$TEST" ]]; then
+
+            echo "test=" >> "$GITHUB_OUTPUT"
+            echo "test_exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          echo "test=$TEST" >> "$GITHUB_OUTPUT"
+
+          if [[ ! -d "tests/$TEST" ]]; then
+
+            echo "test_exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          if [[ ! -f "tests/$TEST/pom.xml" ]]; then
+
+            echo "test_exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          echo "test_exists=true" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------------
+      # Build anonymous matrix
+      # --------------------------------------------------------------
+
+      - name: Build matrix
+        id: matrix
+        if: steps.resolve.outputs.test_exists == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TEST: ${{ steps.resolve.outputs.test }}
+          IMPLEMENTATION: ${{ steps.resolve.outputs.implementation }}
+        run: |
+          set -euo pipefail
+
+          cd test-repo
+
+          RESULT_FILE="results/${TEST}.json"
+
+          if [[ ! -f "$RESULT_FILE" ]]; then
+
+            cat > "$RUNNER_TEMP/previous-results.json" <<EOF
+          {
+            "test": "$TEST",
+            "results": []
+          }
+          EOF
+
+            RESULT_FILE="$RUNNER_TEMP/previous-results.json"
+
+          fi
+
+          yq -o=json '.repositories' config/repositories.yml \
+            > "$RUNNER_TEMP/repositories.json"
+
+          MATRIX_FILE="$RUNNER_TEMP/matrix.json"
+
+          echo "[]" > "$MATRIX_FILE"
+
+          INDEX=0
+
+          while read -r REPOSITORY_JSON; do
+
+            OWNER=$(echo "$REPOSITORY_JSON" | jq -r '.owner')
+            REPOSITORY=$(echo "$REPOSITORY_JSON" | jq -r '.repository')
+
+            INDEX=$((INDEX + 1))
+
+            ID=$(printf "%02d" "$INDEX")
+
+            IMPLEMENTATION_PATH="$RUNNER_TEMP/implementations/$ID"
+            EFFECTIVE_IMPLEMENTATION="$RUNNER_TEMP/effective/$ID"
+
+            rm -rf "$IMPLEMENTATION_PATH"
+            rm -rf "$EFFECTIVE_IMPLEMENTATION"
+
+            mkdir -p \
+              "$IMPLEMENTATION_PATH" \
+              "$EFFECTIVE_IMPLEMENTATION"
+
+            # --------------------------------------------------------
+            # Previous result
+            # --------------------------------------------------------
+
+            PREVIOUS_RESULT=$(jq -r \
+              --arg owner "$OWNER" \
+              --arg repository "$REPOSITORY" \
+              --arg implementation "$IMPLEMENTATION" \
+              '
+              [
+                .results[]
+                | select(
+                    .owner == $owner
+                    and .repository == $repository
+                    and .implementation == $implementation
+                  )
+              ]
+              | last
+              | .result // ""
+              ' "$RESULT_FILE")
+
+            PREVIOUS_HASH=$(jq -r \
+              --arg owner "$OWNER" \
+              --arg repository "$REPOSITORY" \
+              --arg implementation "$IMPLEMENTATION" \
+              '
+              [
+                .results[]
+                | select(
+                    .owner == $owner
+                    and .repository == $repository
+                    and .implementation == $implementation
+                  )
+              ]
+              | last
+              | .implementation_hash // ""
+              ' "$RESULT_FILE")
+
+            # --------------------------------------------------------
+            # Checkout repository
+            # --------------------------------------------------------
+
+            git clone \
+              --quiet \
+              --depth 1 \
+              --filter=blob:none \
+              --sparse \
+              "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPOSITORY}.git" \
+              "$IMPLEMENTATION_PATH" \
+              >/dev/null 2>&1
+
+            cd "$IMPLEMENTATION_PATH"
+
+            git sparse-checkout set "$IMPLEMENTATION" \
+              >/dev/null 2>&1
+
+
+            if [[ ! -d "$IMPLEMENTATION" ]]; then
+              continue
+            fi
+
+            # --------------------------------------------------------
+            # Apply forbidden files
+            # --------------------------------------------------------
+
+            FORBIDDEN_FILE="$GITHUB_WORKSPACE/test-repo/tests/$TEST/forbidden.txt"
+
+            if [[ -f "$FORBIDDEN_FILE" ]]; then
+
+              rsync -a \
+                --quiet \
+                --exclude-from="$FORBIDDEN_FILE" \
+                "$IMPLEMENTATION/" \
+                "$EFFECTIVE_IMPLEMENTATION/"
+
+            else
+
+              rsync -a \
+                --quiet \
+                "$IMPLEMENTATION/" \
+                "$EFFECTIVE_IMPLEMENTATION/"
+
+            fi
+
+            # --------------------------------------------------------
+            # Hash effective implementation
+            # --------------------------------------------------------
+
+            CURRENT_HASH=$(
+              cd "$EFFECTIVE_IMPLEMENTATION"
+
+              find . \
+                -type f \
+                -print0 \
+              | sort -z \
+              | while IFS= read -r -d '' FILE; do
+                  printf '%s\0' "$FILE"
+                  sha256sum "$FILE"
+                done \
+              | sha256sum \
+              | awk '{print $1}'
+            )
+
+            # --------------------------------------------------------
+            # Skip unchanged PASSED implementation
+            # --------------------------------------------------------
+
+            if [[ "$PREVIOUS_RESULT" == "PASSED" ]] \
+              && [[ -n "$PREVIOUS_HASH" ]] \
+              && [[ "$CURRENT_HASH" == "$PREVIOUS_HASH" ]]; then
+
+              continue
+
+            fi
+
+            # --------------------------------------------------------
+            # Anonymous matrix entry
+            # --------------------------------------------------------
+
+            jq \
+              --arg id "$ID" \
+              --arg owner "$OWNER" \
+              --arg repository "$REPOSITORY" \
+              --arg implementation "$IMPLEMENTATION" \
+              --arg implementation_hash "$CURRENT_HASH" \
+              '
+              . += [{
+                id: $id,
+                owner: $owner,
+                repository: $repository,
+                implementation: $implementation,
+                implementation_hash: $implementation_hash
+              }]
+              ' \
+              "$MATRIX_FILE" \
+              > "$MATRIX_FILE.tmp"
+
+            mv \
+              "$MATRIX_FILE.tmp" \
+              "$MATRIX_FILE"
+
+          done < <(
+            jq -c '.[]' "$RUNNER_TEMP/repositories.json"
+          )
+
+          echo "repositories=$(jq -c '.' "$MATRIX_FILE")" \
+            >> "$GITHUB_OUTPUT"
+
+  # ================================================================
+  # TEST
+  # ================================================================
+
+  test:
+    name: Implementation #${{ matrix.repository.id }}
+    needs: prepare
+    if: |
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.test_exists == 'true' &&
+      needs.prepare.outputs.repositories != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+
+      matrix:
+        repository: ${{ fromJSON(needs.prepare.outputs.repositories) }}
+    steps:
+
+      # --------------------------------------------------------------
+      # GitHub App token
+      # --------------------------------------------------------------
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ matrix.repository.owner }}
+          repositories: ${{ matrix.repository.repository }}
+          permission-contents: read
+          permission-issues: write
+
+      # --------------------------------------------------------------
+      # Checkout test-repo
+      # --------------------------------------------------------------
+
+      - name: Checkout test-repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REPOSITORY }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: test-repo
+          persist-credentials: false
+
+      # --------------------------------------------------------------
+      # Checkout implementation
+      # --------------------------------------------------------------
+
+      - name: Checkout implementation
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository.owner }}/${{ matrix.repository.repository }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: implementation-repository
+          persist-credentials: false
+          show-progress: false
+
+      # --------------------------------------------------------------
+      # Test date
+      # --------------------------------------------------------------
+
+      - name: Get test date
+        id: test-date
+        shell: bash
+        run: |
+          echo "date=$(TZ='Europe/Warsaw' date '+%Y-%m-%d %H:%M:%S %Z')" \
+            >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------------
+      # Prepare Maven project
+      # --------------------------------------------------------------
+
+      - name: Prepare test project
+        id: prepare-test
+        shell: bash
+        env:
+          TEST: ${{ needs.prepare.outputs.test }}
+          IMPLEMENTATION: ${{ needs.prepare.outputs.implementation }}
+        run: |
+          set -euo pipefail
+
+          TEST_SOURCE="$GITHUB_WORKSPACE/test-repo/tests/$TEST"
+
+          IMPLEMENTATION_SOURCE="$GITHUB_WORKSPACE/implementation-repository/$IMPLEMENTATION"
+
+          WORK_DIR="$RUNNER_TEMP/test-run"
+
+          if [[ ! -d "$IMPLEMENTATION_SOURCE" ]]; then
+
+            echo "result=SKIPPED" >> "$GITHUB_OUTPUT"
+
+            echo "reason=Implementation directory does not exist" \
+              >> "$GITHUB_OUTPUT"
+
+            exit 0
+
+          fi
+
+          rm -rf "$WORK_DIR"
+
+          mkdir -p \
+            "$WORK_DIR/src/main/java" \
+            "$WORK_DIR/src/test/java"
+
+          # ----------------------------------------------------------
+          # pom.xml
+          # ----------------------------------------------------------
+
+          cp \
+            "$TEST_SOURCE/pom.xml" \
+            "$WORK_DIR/pom.xml"
+
+          # ----------------------------------------------------------
+          # Test production sources
+          # ----------------------------------------------------------
+
+          if [[ -d "$TEST_SOURCE/src/main/java" ]]; then
+
+            cp -R \
+              "$TEST_SOURCE/src/main/java/." \
+              "$WORK_DIR/src/main/java/"
+
+          else
+
+            find "$TEST_SOURCE" \
+              -maxdepth 1 \
+              -type f \
+              -name "*.java" \
+              ! -name "*Test.java" \
+              -exec cp {} "$WORK_DIR/src/main/java/" \;
+
+          fi
+
+          # ----------------------------------------------------------
+          # JUnit sources
+          # ----------------------------------------------------------
+
+          if [[ -d "$TEST_SOURCE/src/test/java" ]]; then
+
+            cp -R \
+              "$TEST_SOURCE/src/test/java/." \
+              "$WORK_DIR/src/test/java/"
+
+          else
+
+            find "$TEST_SOURCE" \
+              -maxdepth 1 \
+              -type f \
+              -name "*Test.java" \
+              -exec cp {} "$WORK_DIR/src/test/java/" \;
+
+          fi
+
+          # ----------------------------------------------------------
+          # Resources
+          # ----------------------------------------------------------
+
+          if [[ -d "$TEST_SOURCE/src/test/resources" ]]; then
+
+            mkdir -p "$WORK_DIR/src/test/resources"
+
+            cp -R \
+              "$TEST_SOURCE/src/test/resources/." \
+              "$WORK_DIR/src/test/resources/"
+
+          fi
+
+          # ----------------------------------------------------------
+          # Implementation
+          # ----------------------------------------------------------
+
+          FORBIDDEN_FILE="$TEST_SOURCE/forbidden.txt"
+
+          if [[ -f "$FORBIDDEN_FILE" ]]; then
+
+            rsync -a \
+              --quiet \
+              --exclude-from="$FORBIDDEN_FILE" \
+              "$IMPLEMENTATION_SOURCE/" \
+              "$WORK_DIR/src/main/java/"
+
+          else
+
+            rsync -a \
+              --quiet \
+              "$IMPLEMENTATION_SOURCE/" \
+              "$WORK_DIR/src/main/java/"
+
+          fi
+
+          echo "result=READY" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------------
+      # Run Maven inside Docker
+      # --------------------------------------------------------------
+
+      - name: Run JUnit
+        id: junit
+        if: steps.prepare-test.outputs.result == 'READY'
+        shell: bash
+        env:
+          WORK_DIR: ${{ runner.temp }}/test-run
+        run: |
+          set +e
+
+          CONTAINER_NAME="test-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.repository.id }}"
+
+          REPORT_DIR="$RUNNER_TEMP/surefire-reports"
+
+          rm -rf "$REPORT_DIR"
+          mkdir -p "$REPORT_DIR"
+
+          timeout \
+            --signal=TERM \
+            --kill-after=10s \
+            180s \
+            docker run \
+              --name "$CONTAINER_NAME" \
+              --network none \
+              --pids-limit 512 \
+              --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+              -v "$WORK_DIR:/input:ro" \
+              maven:3.9-eclipse-temurin-17 \
+              sh -c '
+                set -e
+
+                rm -rf /tmp/test-run
+
+                cp -R /input /tmp/test-run
+
+                cd /tmp/test-run
+
+                mvn \
+                  --batch-mode \
+                  --quiet \
+                  test
+              ' \
+              > "$RUNNER_TEMP/docker-output.txt" \
+              2>&1
+
+          EXIT_CODE=$?
+
+          docker cp \
+            "$CONTAINER_NAME:/tmp/test-run/target/surefire-reports/." \
+            "$REPORT_DIR/" \
+            >/dev/null 2>&1
+
+          DOCKER_CP_EXIT=$?
+
+          docker rm \
+            -f \
+            "$CONTAINER_NAME" \
+            >/dev/null 2>&1
+
+          # ----------------------------------------------------------
+          # 124 = timeout
+          # ----------------------------------------------------------
+
+          if [[ "$EXIT_CODE" -eq 124 ]]; then
+
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+            echo "reason=JUnit execution timed out after 3 minutes" \
+              >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          # ----------------------------------------------------------
+          # No reports means infrastructure/execution error.
+          # ----------------------------------------------------------
+
+          if [[ "$DOCKER_CP_EXIT" -ne 0 ]] \
+            || ! find "$REPORT_DIR" \
+              -type f \
+              -name "TEST-*.xml" \
+              | grep -q .; then
+
+            echo "result=ERROR" >> "$GITHUB_OUTPUT"
+            echo "reason=Test worker failed to produce report" \
+              >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          if [[ "$EXIT_CODE" -eq 0 ]]; then
+
+            echo "result=PASSED" >> "$GITHUB_OUTPUT"
+            echo "reason=All tests passed" \
+              >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+            echo "reason=JUnit tests failed" \
+              >> "$GITHUB_OUTPUT"
+
+          fi
+
+          exit 0
+
+      # --------------------------------------------------------------
+      # Collect failed test names
+      # --------------------------------------------------------------
+
+      - name: Collect failed test names
+        id: junit-results
+        if: |
+          always() &&
+          steps.prepare-test.outputs.result == 'READY'
+        shell: bash
+        run: |
+
+          python3 <<'PY'
+
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+
+          report_dir = os.path.join(
+              os.environ["RUNNER_TEMP"],
+              "surefire-reports"
+          )
+
+          output_file = os.path.join(
+              os.environ["RUNNER_TEMP"],
+              "failed-tests.txt"
+          )
+
+          failed = []
+
+          for report in glob.glob(
+              os.path.join(
+                  report_dir,
+                  "TEST-*.xml"
+              )
+          ):
+
+              try:
+                  root = ET.parse(report).getroot()
+
+              except Exception:
+                  continue
+
+              for testcase in root.findall(".//testcase"):
+
+                  if (
+                      testcase.find("failure") is None
+                      and testcase.find("error") is None
+                  ):
+                      continue
+
+
+                  classname = testcase.attrib.get(
+                      "classname",
+                      ""
+                  )
+
+                  name = testcase.attrib.get(
+                      "name",
+                      ""
+                  )
+
+
+                  if classname:
+                      failed.append(
+                          f"{classname}#{name}"[:50]
+                      )
+                  else:
+                      failed.append(name[:50])
+
+          with open(output_file, "w") as f:
+
+              for test in sorted(set(failed)):
+                  f.write(test + "\n")
+
+          PY
+
+      # --------------------------------------------------------------
+      # Determine final result
+      # --------------------------------------------------------------
+
+      - name: Determine result
+        id: result
+        if: always()
+        shell: bash
+        env:
+          PREPARE_RESULT: ${{ steps.prepare-test.outputs.result }}
+          PREPARE_REASON: ${{ steps.prepare-test.outputs.reason }}
+          JUNIT_RESULT: ${{ steps.junit.outputs.result }}
+          JUNIT_REASON: ${{ steps.junit.outputs.reason }}
+        run: |
+
+          if [[ "$PREPARE_RESULT" == "SKIPPED" ]]; then
+
+            echo "result=SKIPPED" >> "$GITHUB_OUTPUT"
+            echo "reason=$PREPARE_REASON" \
+              >> "$GITHUB_OUTPUT"
+
+          elif [[ "$JUNIT_RESULT" == "PASSED" ]]; then
+
+            echo "result=PASSED" >> "$GITHUB_OUTPUT"
+            echo "reason=All tests passed" \
+              >> "$GITHUB_OUTPUT"
+
+          elif [[ "$JUNIT_RESULT" == "FAILED" ]]; then
+
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+            echo "reason=${JUNIT_REASON:-JUnit tests failed}" \
+              >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "result=ERROR" >> "$GITHUB_OUTPUT"
+            echo "reason=${JUNIT_REASON:-Test worker error}" \
+              >> "$GITHUB_OUTPUT"
+
+          fi
+
+      # --------------------------------------------------------------
+      # Create Issue
+      # --------------------------------------------------------------
+
+      - name: Create result Issue
+        id: issue
+        if: |
+          always() &&
+          steps.result.outputs.result != 'SKIPPED' &&
+          steps.result.outputs.result != 'ERROR'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OWNER: ${{ matrix.repository.owner }}
+          REPOSITORY: ${{ matrix.repository.repository }}
+          IMPLEMENTATION: ${{ needs.prepare.outputs.implementation }}
+          TEST: ${{ needs.prepare.outputs.test }}
+          RESULT: ${{ steps.result.outputs.result }}
+          TEST_DATE: ${{ steps.test-date.outputs.date }}
+        shell: bash
+        run: |
+
+          if [[ "$RESULT" == "PASSED" ]]; then
+            TITLE="[TEST PASSED] $TEST"
+          else
+            TITLE="[TEST FAILED] $TEST"
+          fi
+
+          {
+            echo "## Test result"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Result | **$RESULT** |"
+            echo "| Test | \`$TEST\` |"
+            echo "| Implementation | \`$IMPLEMENTATION\` |"
+            echo "| Test date | \`$TEST_DATE\` |"
+            echo
+
+            if [[ "$RESULT" == "FAILED" ]] \
+              && [[ -s "$RUNNER_TEMP/failed-tests.txt" ]]; then
+
+              echo "### Failed tests"
+              echo
+
+              while IFS= read -r TEST_NAME; do
+
+                [[ -z "$TEST_NAME" ]] && continue
+
+                echo "- \`$TEST_NAME\`"
+
+              done < "$RUNNER_TEMP/failed-tests.txt"
+
+              echo
+
+            fi
+
+          } > "$RUNNER_TEMP/issue-body.md"
+
+          ISSUE_URL=$(gh issue create \
+            --repo "$OWNER/$REPOSITORY" \
+            --title "$TITLE" \
+            --body-file "$RUNNER_TEMP/issue-body.md")
+
+          ISSUE_NUMBER="${ISSUE_URL##*/}"
+
+          echo "issue_number=$ISSUE_NUMBER" \
+            >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------------
+      # Close Issue
+      # --------------------------------------------------------------
+
+      - name: Close result Issue
+        if: |
+          always() &&
+          steps.issue.outputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OWNER: ${{ matrix.repository.owner }}
+          REPOSITORY: ${{ matrix.repository.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
+        shell: bash
+        run: |
+
+          gh issue close \
+            "$ISSUE_NUMBER" \
+            --repo "$OWNER/$REPOSITORY"
+
+      # --------------------------------------------------------------
+      # Create anonymous result
+      # --------------------------------------------------------------
+
+      - name: Create anonymous result
+        if: always()
+        env:
+          ID: ${{ matrix.repository.id }}
+          IMPLEMENTATION_HASH: ${{ matrix.repository.implementation_hash }}
+          RESULT: ${{ steps.result.outputs.result }}
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/result"
+
+          python3 <<'PY'
+
+          import json
+          import os
+
+          result = {
+              "id": os.environ["ID"],
+              "implementation_hash": os.environ["IMPLEMENTATION_HASH"],
+              "result": os.environ["RESULT"]
+          }
+
+          with open(
+              os.path.join(
+                  os.environ["RUNNER_TEMP"],
+                  "result",
+                  "result.json"
+              ),
+              "w"
+          ) as f:
+
+              json.dump(
+                  result,
+                  f,
+                  indent=2
+              )
+
+              f.write("\n")
+
+          PY
+
+      # --------------------------------------------------------------
+      # Upload anonymous result
+      # --------------------------------------------------------------
+
+      - name: Upload anonymous result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.repository.id }}
+          path: ${{ runner.temp }}/result/result.json
+          retention-days: 1
+
+      # --------------------------------------------------------------
+      # Worker error only
+      # --------------------------------------------------------------
+
+      - name: Fail job on worker error
+        if: steps.result.outputs.result == 'ERROR'
+        shell: bash
+        run: |
+
+          echo "Test worker failed."
+          exit 1
+
+  # ================================================================
+  # FINALIZE
+  # ================================================================
+
+  finalize:
+
+    name: Save results
+    needs:
+      - prepare
+      - test
+    if: |
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.test_exists == 'true'
+    runs-on: ubuntu-latest
+    steps:
+
+      # --------------------------------------------------------------
+      # GitHub App token
+      # --------------------------------------------------------------
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ vars.OWNER }}
+          permission-contents: write
+
+      # --------------------------------------------------------------
+      # Checkout test-repo
+      # --------------------------------------------------------------
+
+      - name: Checkout test-repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REPOSITORY }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: test-repo
+          persist-credentials: false
+
+      # --------------------------------------------------------------
+      # Download anonymous results
+      # --------------------------------------------------------------
+
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: matrix-results
+          merge-multiple: false
+
+      # --------------------------------------------------------------
+      # Merge results
+      # --------------------------------------------------------------
+
+      - name: Merge results
+        env:
+          TEST: ${{ needs.prepare.outputs.test }}
+          REPOSITORIES: ${{ needs.prepare.outputs.repositories }}
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          mkdir -p test-repo/results
+
+          RESULT_FILE="test-repo/results/${TEST}.json"
+
+          if [[ -f "$RESULT_FILE" ]]; then
+
+            cp \
+              "$RESULT_FILE" \
+              "$RUNNER_TEMP/previous.json"
+
+          else
+
+            cat > "$RUNNER_TEMP/previous.json" <<EOF
+          {
+            "test": "$TEST",
+            "results": []
+          }
+          EOF
+
+          fi
+
+          python3 <<'PY'
+
+          import glob
+          import json
+          import os
+
+          test = os.environ["TEST"]
+
+          repository_matrix = json.loads(
+              os.environ["REPOSITORIES"]
+          )
+
+          result_file = (
+              f"test-repo/results/{test}.json"
+          )
+
+          with open(
+              os.path.join(
+                  os.environ["RUNNER_TEMP"],
+                  "previous.json"
+              )
+          ) as f:
+
+              data = json.load(f)
+
+          # ----------------------------------------------------------
+          # Existing results
+          # ----------------------------------------------------------
+
+          results = {}
+
+          for result in data.get("results", []):
+
+              key = (
+                  result["owner"],
+                  result["repository"],
+                  result["implementation"]
+              )
+
+              results[key] = result
+
+          # ----------------------------------------------------------
+          # Anonymous matrix lookup
+          # ----------------------------------------------------------
+
+          matrix_by_id = {
+              item["id"]: item
+              for item in repository_matrix
+          }
+
+          # ----------------------------------------------------------
+          # Merge new results
+          # ----------------------------------------------------------
+
+          for file in glob.glob(
+              "matrix-results/**/result.json",
+              recursive=True
+          ):
+
+              with open(file) as f:
+                  anonymous = json.load(f)
+
+              item = matrix_by_id.get(
+                  anonymous.get("id")
+              )
+
+              if item is None:
+                  continue
+
+              result = {
+                  "owner": item["owner"],
+                  "repository": item["repository"],
+                  "implementation": item["implementation"],
+                  "test": test,
+                  "implementation_hash": anonymous[
+                      "implementation_hash"
+                  ],
+                  "result": anonymous["result"]
+              }
+
+              key = (
+                  result["owner"],
+                  result["repository"],
+                  result["implementation"]
+              )
+
+              results[key] = result
+
+          # ----------------------------------------------------------
+          # Write result file
+          # ----------------------------------------------------------
+
+          output = {
+              "test": test,
+              "results": sorted(
+                  results.values(),
+                  key=lambda r: (
+                      r["owner"].lower(),
+                      r["repository"].lower(),
+                      r["implementation"].lower()
+                  )
+              )
+          }
+
+          with open(result_file, "w") as f:
+
+              json.dump(
+                  output,
+                  f,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+              f.write("\n")
+
+          PY
+
+
+      # --------------------------------------------------------------
+      # Commit results
+      # --------------------------------------------------------------
+
+      - name: Commit results
+        working-directory: test-repo
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            "results/${{ needs.prepare.outputs.test }}.json"
+
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+
+          git commit \
+            -m "Update results for ${{ needs.prepare.outputs.test }}" \
+            >/dev/null 2>&1
+
+          git push \
+            >/dev/null 2>&1
