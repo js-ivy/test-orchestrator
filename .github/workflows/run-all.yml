@@ -205,7 +205,6 @@ jobs:
             # --------------------------------------------------------
 
             git clone \
-              --quiet \
               --depth 1 \
               --filter=blob:none \
               --sparse \
