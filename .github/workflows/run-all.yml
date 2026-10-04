@@ -204,6 +204,11 @@ jobs:
             # Checkout repository
             # --------------------------------------------------------
 
+            git ls-remote \
+              "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPOSITORY}.git"
+
+            exit 1
+
             git clone \
               --depth 1 \
               --filter=blob:none \
